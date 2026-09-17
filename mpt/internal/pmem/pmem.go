@@ -191,10 +191,12 @@ type Mem struct {
 	patched     int // length of “patched” section of memory
 	current     *writer
 	next        *writer
-	disk        File  // disk-only (not in memory) storage
-	diskOff     int64 // offset where user writes begin
-	diskSize    int64 // logical size of disk-only data
-	diskPatched int64 // last diskSize recorded in patch
+	disk        File   // disk-only (not in memory) storage
+	diskOff     int64  // offset where user writes begin
+	diskSize    int64  // logical size of disk-only data
+	diskPatched int64  // last diskSize recorded in patch
+	diskBuf     []byte // pending appends to disk, not yet written
+	diskBufOff  int64  // offset in disk-only data of diskBuf[0]
 	patch       []byte
 	group       int // group start in patch, or -1 if not in group
 	groupData   int // total group data
@@ -715,12 +717,44 @@ func (m *Mem) Mutate(dst, src []byte) error {
 	})
 }
 
+// maxDiskBuf is the size at which pending disk-only appends are written out.
+//
+// Writes to the disk-only file are small — a single leaf is typically well
+// under 100 bytes — and issuing one write syscall per leaf dominated the cost
+// of a tree update. The cost of such a write is almost entirely per-call rather
+// than per-byte, so coalescing appends into page-sized writes removes nearly
+// all of it. One page captures the win; larger buffers add very little.
+const maxDiskBuf = 64 << 10
+
+// flushDiskBuf writes any pending disk-only appends to the disk file.
+//
+// This must happen before the patch frame describing those appends is written,
+// so that a patch is never durable while the disk bytes it refers to are not:
+// compaction eventually discards old patches, after which the disk file is the
+// only copy. [Mem.flushPatch] enforces that ordering.
+func (m *Mem) flushDiskBuf() error {
+	if len(m.diskBuf) == 0 {
+		return nil
+	}
+	if _, err := m.disk.WriteAt(m.diskBuf, m.diskOff+m.diskBufOff); err != nil {
+		return m.broken(err)
+	}
+	m.diskBufOff += int64(len(m.diskBuf))
+	m.diskBuf = m.diskBuf[:0]
+	return nil
+}
+
 // WriteDisk writes src to the disk-only file at offset off.
 // It guarantees that on recovery after a crash,
 // all disk writes that occurred in or before
 // the latest recovered transaction will be available for reading.
 // (Disk writes that happened after that transaction may or may not
 // be available for reading as well.)
+//
+// The write may be buffered in memory rather than passed to the underlying
+// file immediately. [Mem.ReadDisk] accounts for this, and the guarantee above
+// is unaffected: the bytes are recorded in the patch alongside the write and
+// are replayed on recovery.
 func (m *Mem) WriteDisk(src []byte, off int64) error {
 	if m.err != nil {
 		return m.err
@@ -729,14 +763,56 @@ func (m *Mem) WriteDisk(src []byte, off int64) error {
 		return nil
 	}
 	return m.mutate(uint64(off)<<1|1, src, func() error {
-		_, err := m.disk.WriteAt(src, m.diskOff+off)
-		if err != nil {
-			return m.broken(err)
+		if err := m.writeDisk(src, off); err != nil {
+			return err
 		}
 		m.diskSize = max(m.diskSize, off+int64(len(src)))
 		m.diskPatched = max(m.diskPatched, off+int64(len(src)))
 		return nil
 	})
+}
+
+// writeDisk buffers src for writing to the disk-only file at off,
+// or writes it directly if it cannot be buffered.
+//
+// The buffer always holds a contiguous run of bytes ending at diskSize,
+// so that ReadDisk can satisfy any read from the file, the buffer, or a
+// file prefix followed by a buffer suffix.
+func (m *Mem) writeDisk(src []byte, off int64) error {
+	// Appending at the logical end. This is the common case: one leaf per Set.
+	if off == m.diskSize {
+		if len(m.diskBuf) == 0 {
+			m.diskBufOff = off
+		} else if off != m.diskBufOff+int64(len(m.diskBuf)) {
+			if err := m.flushDiskBuf(); err != nil {
+				return err
+			}
+			m.diskBufOff = off
+		}
+		m.diskBuf = append(m.diskBuf, src...)
+		if len(m.diskBuf) >= maxDiskBuf {
+			return m.flushDiskBuf()
+		}
+		return nil
+	}
+
+	// An in-place overwrite landing entirely inside the pending buffer,
+	// such as updating a leaf value that still fits in its existing space.
+	if len(m.diskBuf) > 0 && off >= m.diskBufOff &&
+		off+int64(len(src)) <= m.diskBufOff+int64(len(m.diskBuf)) {
+		copy(m.diskBuf[off-m.diskBufOff:], src)
+		return nil
+	}
+
+	// Anything else: flush the pending run and write through, preserving
+	// the invariant that the buffer is contiguous and ends at diskSize.
+	if err := m.flushDiskBuf(); err != nil {
+		return err
+	}
+	if _, err := m.disk.WriteAt(src, m.diskOff+off); err != nil {
+		return m.broken(err)
+	}
+	return nil
 }
 
 // ReadDisk reads into dst from the disk-only file at offset off.
@@ -750,8 +826,30 @@ func (m *Mem) ReadDisk(dst []byte, off int64) error {
 	if len(dst) == 0 {
 		return nil
 	}
-	_, err := m.disk.ReadAt(dst, m.diskOff+off)
-	if err != nil {
+
+	// Overlay any pending appends, which are not in the file yet.
+	if lo := m.diskBufOff; len(m.diskBuf) > 0 && off+int64(len(dst)) > lo {
+		hi := lo + int64(len(m.diskBuf))
+		if off >= lo {
+			if off+int64(len(dst)) > hi {
+				return m.broken(fmt.Errorf("pmem: internal error: disk read past buffered data"))
+			}
+			copy(dst, m.diskBuf[off-lo:])
+			return nil
+		}
+		// Straddles the boundary: file part, then buffer part.
+		n := int(lo - off)
+		if err := m.readDisk(dst[:n], off); err != nil {
+			return err
+		}
+		copy(dst[n:], m.diskBuf)
+		return nil
+	}
+	return m.readDisk(dst, off)
+}
+
+func (m *Mem) readDisk(dst []byte, off int64) error {
+	if _, err := m.disk.ReadAt(dst, m.diskOff+off); err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
 		}
@@ -822,6 +920,15 @@ func (m *Mem) mutate(off uint64, src []byte, commit func() error) error {
 // If there is an active mutation group, only the buffer before
 // that group is written.
 func (m *Mem) flushPatch(needSpace bool) error {
+	// Any disk-only bytes described by the patch we are about to write must
+	// already be in the disk file: a patch must never become durable while the
+	// disk data it refers to is still only in memory, because compaction
+	// eventually discards the patch and leaves the file as the only copy.
+	if m.disk != nil {
+		if err := m.flushDiskBuf(); err != nil {
+			return err
+		}
+	}
 	var p []byte
 	if m.group >= 0 {
 		// Can only write up to m.group, but final mem len is already there.

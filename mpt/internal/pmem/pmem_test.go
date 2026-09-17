@@ -422,8 +422,12 @@ func (tt *tester) markOK() {
 	}
 
 	if tt.mem.disk != nil && size > 0 {
+		// Read the logical disk content rather than the raw file: WriteDisk
+		// coalesces small appends, so bytes already written by this state may
+		// still be pending in memory. Recovery replays them from the patch log,
+		// so they are legitimate values for this state and must be recorded.
 		data := make([]byte, size)
-		tt.mem.disk.ReadAt(data, tt.mem.diskOff)
+		tt.mem.ReadDisk(data, 0)
 
 		for _, sizes := range tt.validDisk {
 			for s, vd := range sizes {
