@@ -284,6 +284,16 @@ type Tree interface {
 	// (including other calls to Set).
 	Set(key Key, val Val) error
 
+	// SetBatch adds or updates the given key-value pairs in the tree.
+	// Changes must be sorted in strictly increasing key order (by [Key.Compare])
+	// with no duplicate keys, and each key and value must be at most
+	// [MaxKeyLen] and [MaxValLen] bytes; otherwise SetBatch returns an error
+	// ([ErrKeyOrder], [ErrKeySize], or [ErrValSize]) without modifying the tree.
+	//
+	// SetBatch is a mutating operation and must not be called
+	// concurrently with any other Tree method calls.
+	SetBatch(changes []KeyVal) error
+
 	// Predict returns the hash of the tree that would result from
 	// applying the given changes (sorted by key) to the tree,
 	// without modifying the tree.
@@ -394,6 +404,23 @@ func checkChanges(changes []KeyVal) error {
 	for i := 0; i < len(changes)-1; i++ {
 		if changes[i].Key.Compare(changes[i+1].Key) >= 0 {
 			return ErrInvalidPredict
+		}
+	}
+	return nil
+}
+
+func checkBatch(changes []KeyVal) error {
+	for _, c := range changes {
+		if len(c.Key) > MaxKeyLen {
+			return ErrKeySize
+		}
+		if len(c.Val) > MaxValLen {
+			return ErrValSize
+		}
+	}
+	for i := 0; i < len(changes)-1; i++ {
+		if changes[i].Key.Compare(changes[i+1].Key) >= 0 {
+			return ErrKeyOrder
 		}
 	}
 	return nil
@@ -998,6 +1025,23 @@ func bit(b []byte, n int) int {
 		return 0
 	}
 	return 1
+}
+
+// hashLeafFast computes hashLeaf without heap allocation when the encoded
+// leaf fits in a 256-byte stack buffer.
+func hashLeafFast(key Key, val Val) Hash {
+	needed := 1 + binary.MaxVarintLen64 + len(key) + binary.MaxVarintLen64 + len(val)
+	if needed <= 256 {
+		var buf [256]byte
+		buf[0] = 0
+		n := 1
+		n += binary.PutUvarint(buf[n:], uint64(len(key)))
+		n += copy(buf[n:], key)
+		n += binary.PutUvarint(buf[n:], uint64(len(val)))
+		n += copy(buf[n:], val)
+		return sha256.Sum256(buf[:n])
+	}
+	return hashLeaf(key, val)
 }
 
 // hashLeaf returns the hash of a leaf with a given key and value,

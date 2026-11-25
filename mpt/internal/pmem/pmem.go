@@ -28,6 +28,7 @@ import (
 
 	"filippo.io/torchwood/mpt/internal/slicemath"
 	"filippo.io/torchwood/mpt/internal/span"
+	"golang.org/x/sys/unix"
 )
 
 const verboseIO = false
@@ -182,25 +183,32 @@ func (*devNull) Sync() error { return nil }
 // Those accesses will fault, meaning they crash the program unless
 // [runtime/debug.SetPanicOnFault] has been used.
 type Mem struct {
-	magic       string
-	id          [16]byte
-	tmp         [frameExtra]byte
-	ptmp        [2 * binary.MaxVarintLen64]byte
-	span        *span.Span
-	mem         []byte
-	patched     int // length of “patched” section of memory
-	current     *writer
-	next        *writer
-	disk        File  // disk-only (not in memory) storage
-	diskOff     int64 // offset where user writes begin
-	diskSize    int64 // logical size of disk-only data
-	diskPatched int64 // last diskSize recorded in patch
-	patch       []byte
-	group       int // group start in patch, or -1 if not in group
-	groupData   int // total group data
-	err         error
-	closed      bool
-	compact     compact
+	magic           string
+	id              [16]byte
+	tmp             [frameExtra]byte
+	ptmp            [2 * binary.MaxVarintLen64]byte
+	span            *span.Span
+	mem             []byte
+	patched         int // length of “patched” section of memory
+	current         *writer
+	next            *writer
+	disk            File   // disk-only (not in memory) storage
+	diskOff         int64  // offset where user writes begin
+	diskSize        int64  // logical size of disk-only data
+	diskFlushed     int64  // bytes [0..diskFlushed) written through to disk
+	diskPatched     int64  // last diskSize recorded in patch
+	bufDisk         bool   // coalesce disk appends + mmap disk reads/overwrites
+	diskBuf         []byte // pending appends to disk when bufDisk is true
+	diskBufOff      int64  // offset in disk-only data of diskBuf[0]
+	diskMap         []byte // optional MAP_SHARED view of disk file
+	diskMapWritable bool   // whether diskMap was mapped with PROT_WRITE
+	diskMapDirty    bool   // whether diskMap was modified since last Sync
+	patch           []byte
+	group           int // group start in patch, or -1 if not in group
+	groupData       int // total group data
+	err             error
+	closed          bool
+	compact         compact
 
 	constantFlushing bool
 
@@ -431,6 +439,7 @@ func open(magic string, file1, file2, disk File) (_ *Mem, err error) {
 	if err := m.readFile(r1); err != nil {
 		return nil, err
 	}
+	m.diskFlushed = m.diskSize
 	m.diskPatched = m.diskSize
 	m.current = newWriter(r1.file, r1.seq)
 	m.current.off = r1.off
@@ -721,6 +730,45 @@ func (m *Mem) Mutate(dst, src []byte) error {
 	})
 }
 
+const maxDiskBuf = 64 << 10
+
+// EnableBufferedDisk enables coalescing of small appends to the disk-only file
+// into 64 KiB writes and, when the underlying File exposes an OS file
+// descriptor, memory-maps the disk file so ReadDisk and in-place overwrites of
+// already-flushed regions avoid pread64/pwrite64 syscalls.
+func (m *Mem) EnableBufferedDisk() {
+	if m.bufDisk {
+		return
+	}
+	m.bufDisk = true
+	m.diskFlushed = m.diskSize
+	m.diskBuf = make([]byte, 0, maxDiskBuf)
+	if m.disk != nil {
+		if f, ok := m.disk.(interface{ Fd() uintptr }); ok {
+			mapCap := min(maxMem, 64<<30)
+			if mapped, err := unix.Mmap(int(f.Fd()), 0, mapCap, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED); err == nil {
+				m.diskMap = mapped
+				m.diskMapWritable = true
+			} else if mapped, err := unix.Mmap(int(f.Fd()), 0, mapCap, unix.PROT_READ, unix.MAP_SHARED); err == nil {
+				m.diskMap = mapped
+			}
+		}
+	}
+}
+
+func (m *Mem) flushDiskBuf() error {
+	if len(m.diskBuf) == 0 {
+		return nil
+	}
+	if _, err := m.disk.WriteAt(m.diskBuf, m.diskOff+m.diskBufOff); err != nil {
+		return m.broken(err)
+	}
+	m.diskBufOff += int64(len(m.diskBuf))
+	m.diskFlushed = max(m.diskFlushed, m.diskBufOff)
+	m.diskBuf = m.diskBuf[:0]
+	return nil
+}
+
 // WriteDisk writes src to the disk-only file at offset off.
 // It guarantees that on recovery after a crash,
 // all disk writes that occurred in or before
@@ -735,14 +783,85 @@ func (m *Mem) WriteDisk(src []byte, off int64) error {
 		return nil
 	}
 	return m.mutate(uint64(off)<<1|1, src, func() error {
-		_, err := m.disk.WriteAt(src, m.diskOff+off)
-		if err != nil {
-			return m.broken(err)
+		if m.bufDisk {
+			if err := m.writeDiskBuffered(src, off); err != nil {
+				return err
+			}
+		} else {
+			if _, err := m.disk.WriteAt(src, m.diskOff+off); err != nil {
+				return m.broken(err)
+			}
+			m.diskFlushed = max(m.diskFlushed, off+int64(len(src)))
 		}
 		m.diskSize = max(m.diskSize, off+int64(len(src)))
 		m.diskPatched = max(m.diskPatched, off+int64(len(src)))
 		return nil
 	})
+}
+
+func (m *Mem) writeDiskBuffered(src []byte, off int64) error {
+	if off == m.diskSize {
+		if len(m.diskBuf) == 0 {
+			m.diskBufOff = off
+		} else if off != m.diskBufOff+int64(len(m.diskBuf)) {
+			if err := m.flushDiskBuf(); err != nil {
+				return err
+			}
+			m.diskBufOff = off
+		}
+		if len(m.diskBuf)+len(src) > maxDiskBuf && len(m.diskBuf) > 0 {
+			if err := m.flushDiskBuf(); err != nil {
+				return err
+			}
+			m.diskBufOff = off
+		}
+		if len(src) >= maxDiskBuf {
+			if _, err := m.disk.WriteAt(src, m.diskOff+off); err != nil {
+				return m.broken(err)
+			}
+			m.diskBufOff = off + int64(len(src))
+			m.diskFlushed = max(m.diskFlushed, m.diskBufOff)
+			return nil
+		}
+		m.diskBuf = append(m.diskBuf, src...)
+		if len(m.diskBuf) >= maxDiskBuf {
+			return m.flushDiskBuf()
+		}
+		return nil
+	}
+
+	if len(m.diskBuf) > 0 && off >= m.diskBufOff &&
+		off+int64(len(src)) <= m.diskBufOff+int64(len(m.diskBuf)) {
+		copy(m.diskBuf[off-m.diskBufOff:], src)
+		return nil
+	}
+
+	// Non-overlapping in-place overwrite inside the already-flushed file prefix:
+	// keep pending tail appends in m.diskBuf intact, and write directly via
+	// MAP_SHARED when available.
+	if off >= 0 && off+int64(len(src)) <= m.diskFlushed &&
+		(len(m.diskBuf) == 0 || off+int64(len(src)) <= m.diskBufOff) {
+		rawOff := m.diskOff + off
+		rawEnd := rawOff + int64(len(src))
+		if m.diskMap != nil && m.diskMapWritable && rawEnd <= int64(len(m.diskMap)) {
+			copy(m.diskMap[rawOff:rawEnd], src)
+			m.diskMapDirty = true
+			return nil
+		}
+		if _, err := m.disk.WriteAt(src, rawOff); err != nil {
+			return m.broken(err)
+		}
+		return nil
+	}
+
+	if err := m.flushDiskBuf(); err != nil {
+		return err
+	}
+	if _, err := m.disk.WriteAt(src, m.diskOff+off); err != nil {
+		return m.broken(err)
+	}
+	m.diskFlushed = max(m.diskFlushed, off+int64(len(src)))
+	return nil
 }
 
 // ReadDisk reads into dst from the disk-only file at offset off.
@@ -755,6 +874,37 @@ func (m *Mem) ReadDisk(dst []byte, off int64) error {
 	}
 	if len(dst) == 0 {
 		return nil
+	}
+	if m.bufDisk && len(m.diskBuf) > 0 {
+		lo := m.diskBufOff
+		hi := lo + int64(len(m.diskBuf))
+		if off+int64(len(dst)) > lo {
+			if off >= lo {
+				if off+int64(len(dst)) > hi {
+					return m.broken(fmt.Errorf("pmem: internal error: disk read past buffered data"))
+				}
+				copy(dst, m.diskBuf[off-lo:])
+				return nil
+			}
+			n := int(lo - off)
+			if err := m.readDiskFlushed(dst[:n], off); err != nil {
+				return err
+			}
+			copy(dst[n:], m.diskBuf)
+			return nil
+		}
+	}
+	return m.readDiskFlushed(dst, off)
+}
+
+func (m *Mem) readDiskFlushed(dst []byte, off int64) error {
+	if m.diskMap != nil && off+int64(len(dst)) <= m.diskFlushed {
+		rawOff := m.diskOff + off
+		rawEnd := rawOff + int64(len(dst))
+		if rawEnd <= int64(len(m.diskMap)) {
+			copy(dst, m.diskMap[rawOff:rawEnd])
+			return nil
+		}
 	}
 	_, err := m.disk.ReadAt(dst, m.diskOff+off)
 	if err != nil {
@@ -828,6 +978,11 @@ func (m *Mem) mutate(off uint64, src []byte, commit func() error) error {
 // If there is an active mutation group, only the buffer before
 // that group is written.
 func (m *Mem) flushPatch(needSpace bool) error {
+	if m.disk != nil && m.bufDisk {
+		if err := m.flushDiskBuf(); err != nil {
+			return err
+		}
+	}
 	var p []byte
 	if m.group >= 0 {
 		// Can only write up to m.group, but final mem len is already there.
@@ -1105,6 +1260,12 @@ func (m *Mem) Sync() error {
 	if m.syncHook != nil {
 		m.syncHook()
 	}
+	if m.diskMapDirty && m.disk != nil {
+		if err := m.disk.Sync(); err != nil {
+			return m.broken(err)
+		}
+		m.diskMapDirty = false
+	}
 	if err := m.sync(m.current); err != nil {
 		return err
 	}
@@ -1145,6 +1306,12 @@ func (m *Mem) sync(w *writer) error {
 func (m *Mem) Release() error {
 	// Collect errors as we go, but make sure to reach end. No early returns.
 	m.Sync()
+	if m.diskMap != nil {
+		if err := unix.Munmap(m.diskMap); err != nil {
+			m.broken(err)
+		}
+		m.diskMap = nil
+	}
 	if m.mem != nil {
 		if err := m.span.Release(); err != nil {
 			m.broken(err)

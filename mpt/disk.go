@@ -98,6 +98,11 @@ type diskTree struct {
 	leaf   File
 	closed bool
 	err    error // sticky error
+
+	bufLeafIO bool     // coalesce leaf writes + mmap leaf reads + reuse leaf buffers
+	leafBuf   []byte   // reusable buffer for single-leaf reads when bufLeafIO is set
+	appendBuf []byte   // reusable buffer for leaf writes
+	bufPool   [][]byte // reusable buffers for recursive SetBatch leaf probes
 }
 
 // broken marks the tree broken with err as the reason.
@@ -112,20 +117,47 @@ func (t *diskTree) broken(err error) error {
 	return err
 }
 
+// An Option configures an on-disk [Tree] opened by [Create], [Open], or [New].
+type Option func(*options)
+
+type options struct {
+	bufLeafIO bool
+}
+
+func newOptions(opts []Option) options {
+	var o options
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&o)
+		}
+	}
+	return o
+}
+
+// BufferLeafIO configures whether the on-disk tree coalesces leaf appends in
+// memory, reuses leaf encode/decode scratch buffers, and memory-maps the leaf
+// file for reads when backed by an OS file descriptor. It is disabled by
+// default.
+func BufferLeafIO(enable bool) Option {
+	return func(o *options) {
+		o.bufLeafIO = enable
+	}
+}
+
 // Create creates a new, empty on-disk [Tree] stored in the two named files.
 // The files must not already exist, unless they are both os.DevNull,
 // in which case the Tree is held only in memory.
-func Create(file1, file2, disk string) (Tree, error) {
-	return open(file1, file2, disk, os.O_WRONLY|os.O_CREATE|os.O_EXCL, "create")
+func Create(file1, file2, disk string, opts ...Option) (Tree, error) {
+	return open(file1, file2, disk, os.O_WRONLY|os.O_CREATE|os.O_EXCL, "create", opts)
 }
 
 // Open opens an on-disk [Tree] stored in the two named files.
 // The files must have been created by a previous call to [Create].
-func Open(file1, file2, disk string) (Tree, error) {
-	return open(file1, file2, disk, os.O_RDWR, "open")
+func Open(file1, file2, disk string, opts ...Option) (Tree, error) {
+	return open(file1, file2, disk, os.O_RDWR, "open", opts)
 }
 
-func open(file1, file2, file3 string, mode int, op string) (Tree, error) {
+func open(file1, file2, file3 string, mode int, op string, opts []Option) (Tree, error) {
 	f1, err := os.OpenFile(file1, mode, 0666)
 	if err != nil {
 		return nil, err
@@ -144,7 +176,7 @@ func open(file1, file2, file3 string, mode int, op string) (Tree, error) {
 		f2.Close()
 		return nil, err
 	}
-	return memOpen(f1, f2, f3, op)
+	return memOpen(f1, f2, f3, op, opts)
 }
 
 // New creates or opens an on-disk [Tree] in the given files.
@@ -152,7 +184,7 @@ func open(file1, file2, file3 string, mode int, op string) (Tree, error) {
 // Otherwise, New opens a pre-existing tree stored in those files.
 // Only one file contains the latest tree at a time, but the
 // implementation alternates between files to implement atomic updates.
-func New(file1, file2, file3 File) (Tree, error) {
+func New(file1, file2, file3 File, opts ...Option) (Tree, error) {
 	var op string
 	var buf [1]byte
 	n1, err1 := file1.ReadAt(buf[:], 0)
@@ -162,7 +194,7 @@ func New(file1, file2, file3 File) (Tree, error) {
 	} else {
 		op = "open"
 	}
-	return memOpen(file1, file2, file3, op)
+	return memOpen(file1, file2, file3, op, opts)
 }
 
 // memOpen is the general implementation of open.
@@ -171,7 +203,8 @@ func New(file1, file2, file3 File) (Tree, error) {
 // try to use the files' Sync method.
 // (When using /dev/null for an in-memory tree,
 // we avoid calling Sync, because it will fail.)
-func memOpen(file1, file2, disk File, op string) (_ Tree, err error) {
+func memOpen(file1, file2, disk File, op string, opts []Option) (_ Tree, err error) {
+	o := newOptions(opts)
 	pmemOp := pmem.Open
 	if op == "create" {
 		pmemOp = pmem.Create
@@ -181,10 +214,11 @@ func memOpen(file1, file2, disk File, op string) (_ Tree, err error) {
 		return nil, err
 	}
 	t := &diskTree{
-		pmem:  mem,
-		file1: file1,
-		file2: file2,
-		leaf:  disk,
+		pmem:      mem,
+		file1:     file1,
+		file2:     file2,
+		leaf:      disk,
+		bufLeafIO: o.bufLeafIO,
 	}
 	defer func() {
 		if err != nil {
@@ -192,6 +226,10 @@ func memOpen(file1, file2, disk File, op string) (_ Tree, err error) {
 			mem.UnsafeUnmap()
 		}
 	}()
+
+	if o.bufLeafIO {
+		mem.EnableBufferedDisk()
+	}
 
 	runtime.AddCleanup(t, func(*struct{}) { mem.Release() }, nil)
 
@@ -449,6 +487,62 @@ func (n *diskNode) key(t *diskTree) (Key, error) {
 	return key, err
 }
 
+// keyMut returns the key for node n using t.leafBuf when t.bufLeafIO is set.
+// It may only be called from single-writer mutation paths (such as Set).
+func (n *diskNode) keyMut(t *diskTree) (Key, error) {
+	if t.bufLeafIO {
+		buf, key, _, err := loadLeafInto(t, t.leafBuf, int64(n.leaf()), false)
+		t.leafBuf = buf
+		return key, err
+	}
+	_, key, _, err := loadLeaf(t, int64(n.leaf()), false)
+	return key, err
+}
+
+// hashLeafAt loads the leaf at off and computes its leaf hash without mutating
+// shared tree scratch buffers, using a stack buffer when the encoded leaf fits
+// in 256 bytes so concurrent readers (Path, ProveLookup, ProvePrefix, Predict)
+// remain race-free and allocation-free.
+func hashLeafAt(t *diskTree, off int64) (Hash, error) {
+	limit := t.pmem.DiskSize() - off
+	if limit <= 2 {
+		return Hash{}, t.broken(errCorrupt)
+	}
+	var stack [256]byte
+	need := int(min(limit, int64(len(stack))))
+	buf := stack[:need]
+	if err := t.pmem.ReadDisk(buf, off); err != nil {
+		return Hash{}, t.broken(err)
+	}
+	total := int(binary.BigEndian.Uint16(buf))
+	if total < 2 || total > 2+2*binary.MaxVarintLen64+MaxKeyLen+MaxValLen || int64(total) > limit {
+		return Hash{}, t.broken(errCorrupt)
+	}
+	if total > len(buf) {
+		_, key, val, err := loadLeaf(t, off, true)
+		if err != nil {
+			return Hash{}, err
+		}
+		return hashLeafFast(key, val), nil
+	}
+	buf = buf[:total]
+	i := 2
+	kn, kvn := binary.Uvarint(buf[i:])
+	if kvn <= 0 || kn > uint64(len(buf)-i-kvn) {
+		return Hash{}, t.broken(errCorrupt)
+	}
+	i += kvn
+	key := Key(buf[i : i+int(kn)])
+	i += int(kn)
+	vn, vvn := binary.Uvarint(buf[i:])
+	if vvn <= 0 || vn > uint64(len(buf)-i-vvn) {
+		return Hash{}, t.broken(errCorrupt)
+	}
+	i += vvn
+	val := Val(buf[i : i+int(vn)])
+	return hashLeafFast(key, val), nil
+}
+
 // keyVal returns the key and value for node n.
 func (n *diskNode) keyVal(t *diskTree) (Key, Val, error) {
 	_, key, val, err := loadLeaf(t, int64(n.leaf()), true)
@@ -523,7 +617,17 @@ func (n *diskNode) setDirty(t *diskTree, d bool) error {
 // recovery (Version + Set) which will correct any corrupted values.
 
 func appendLeaf(t *diskTree, key Key, val Val) error {
-	buf := make([]byte, 2, 256)
+	var buf []byte
+	if t.bufLeafIO {
+		needed := 2 + binary.MaxVarintLen64 + len(key) + binary.MaxVarintLen64 + len(val)
+		buf = t.appendBuf[:0]
+		if cap(buf) < needed {
+			buf = make([]byte, 0, max(needed, 256))
+		}
+		buf = buf[:2]
+	} else {
+		buf = make([]byte, 2, 256)
+	}
 	buf = binary.AppendUvarint(buf, uint64(len(key)))
 	buf = append(buf, key...)
 	buf = binary.AppendUvarint(buf, uint64(len(val)))
@@ -533,6 +637,9 @@ func appendLeaf(t *diskTree, key Key, val Val) error {
 		panic("overflow in setKeyVal")
 	}
 	binary.BigEndian.PutUint16(buf, uint16(len(buf)))
+	if t.bufLeafIO {
+		t.appendBuf = buf
+	}
 
 	off := t.pmem.DiskSize()
 	if err := t.pmem.WriteDisk(buf, off); err != nil {
@@ -544,15 +651,31 @@ func appendLeaf(t *diskTree, key Key, val Val) error {
 func (n *diskNode) setVal(t *diskTree, val Val) error {
 	// Read existing key-val data in hopes of updating in place on disk.
 	off := int64(n.leaf())
-	buf, key, _, err := loadLeaf(t, off, false)
-	if err != nil {
-		return err
+	var (
+		buf []byte
+		key Key
+		err error
+	)
+	if t.bufLeafIO {
+		buf, key, _, err = loadLeafInto(t, t.leafBuf, off, false)
+		if err != nil {
+			return err
+		}
+		t.leafBuf = buf
+	} else {
+		buf, key, _, err = loadLeaf(t, off, false)
+		if err != nil {
+			return err
+		}
 	}
 	old := len(buf)
 	tn := 2 // uint16 len
 	_, kn := binary.Uvarint(buf[tn:])
 	vstart := tn + kn + len(key)
 	buf = append(binary.AppendUvarint(buf[:vstart], uint64(len(val))), val...)
+	if t.bufLeafIO {
+		t.leafBuf = buf
+	}
 	if len(buf) <= old {
 		// Overwrite existing value in place.
 		if err := t.pmem.WriteDisk(buf[vstart:], off+int64(vstart)); err != nil {
@@ -574,17 +697,26 @@ func (n *diskNode) setVal(t *diskTree, val Val) error {
 // loadLeaf loads a key-value pair from the leaf disk.
 // If wantVal is false, it skips loading (and ignores any corruption in) the value.
 func loadLeaf(t *diskTree, off int64, wantVal bool) (buf []byte, key Key, val Val, err error) {
+	return loadLeafInto(t, nil, off, wantVal)
+}
+
+func loadLeafInto(t *diskTree, buf []byte, off int64, wantVal bool) (bufOut []byte, key Key, val Val, err error) {
 	// Read initial chunk, decode total, read more if needed, and trim buf.
 	limit := t.pmem.DiskSize() - off
 	if limit <= 2 {
 		return nil, nil, nil, t.broken(errCorrupt)
 	}
-	buf = make([]byte, int(min(limit, 256)))
+	need := int(min(limit, 256))
+	if cap(buf) < need {
+		buf = make([]byte, need)
+	} else {
+		buf = buf[:need]
+	}
 	if err := t.pmem.ReadDisk(buf, off); err != nil {
 		return nil, nil, nil, t.broken(err)
 	}
 	total := int(binary.BigEndian.Uint16(buf))
-	if total > 2+2*binary.MaxVarintLen64+MaxKeyLen+MaxValLen || int64(total) > limit {
+	if total < 2 || total > 2+2*binary.MaxVarintLen64+MaxKeyLen+MaxValLen || int64(total) > limit {
 		return nil, nil, nil, t.broken(errCorrupt)
 	}
 	if len(buf) < total {

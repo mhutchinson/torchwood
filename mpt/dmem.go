@@ -15,6 +15,9 @@ import (
 // pbit is the parent bit depth, controlling whether n is viewed as a leaf.
 func (n *diskNode) hash(t *diskTree, pbit int) (Hash, error) {
 	if n.bit() <= pbit {
+		if t.bufLeafIO {
+			return hashLeafAt(t, int64(n.leaf()))
+		}
 		key, val, err := n.keyVal(t)
 		if err != nil {
 			return Hash{}, err
@@ -192,7 +195,7 @@ func (n *diskNode) set(t *diskTree, pbit int, key Key, val Val) (int, error) {
 	nbit := n.bit()
 	if nbit <= pbit {
 		// view n as leaf
-		nkey, err := n.key(t)
+		nkey, err := n.keyMut(t)
 		if err != nil {
 			return 0, err
 		}
