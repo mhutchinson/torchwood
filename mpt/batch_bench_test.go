@@ -400,22 +400,7 @@ func TestNVMeBenchMatrix(t *testing.T) {
 		{"D", "SetBatch + Buf/Mmap", true, []Option{BufferLeafIO(true)}},
 	}
 
-	type resultRow struct {
-		scenario     string
-		variantID    string
-		variantLabel string
-		keys         int
-		mutateSync   time.Duration
-		totalDur     time.Duration
-		keysPerSec   float64
-		allocBytesOp float64
-		allocsOp     float64
-		io           ioCounters
-		rootHash     Hash
-	}
-	var allRows []resultRow
-
-	runOne := func(scenario, profSlug string, dir string, create bool, ver int64, batch []KeyVal, v variant) resultRow {
+	runOne := func(scenario, profSlug string, dir string, create bool, ver int64, batch []KeyVal, v variant) Hash {
 		tr, ctl, err := openBenchDiskTree(dir, create, v.opts...)
 		if err != nil {
 			t.Fatalf("%s %s open: %v", scenario, v.id, err)
@@ -476,29 +461,19 @@ func TestNVMeBenchMatrix(t *testing.T) {
 
 		ioSnap := ctl.snapshotCounters()
 		n := float64(len(batch))
-		row := resultRow{
-			scenario:     scenario,
-			variantID:    v.id,
-			variantLabel: v.label,
-			keys:         len(batch),
-			mutateSync:   mutateSyncDur,
-			totalDur:     totalDur,
-			keysPerSec:   n / totalDur.Seconds(),
-			allocBytesOp: float64(msAfter.TotalAlloc-msBefore.TotalAlloc) / n,
-			allocsOp:     float64(msAfter.Mallocs-msBefore.Mallocs) / n,
-			io:           ioSnap,
-			rootHash:     snap.Hash,
-		}
+		keysPerSec := n / totalDur.Seconds()
+		allocBytesOp := float64(msAfter.TotalAlloc-msBefore.TotalAlloc) / n
+		allocsOp := float64(msAfter.Mallocs-msBefore.Mallocs) / n
 		t.Logf("[%s | %s (%s)] keys=%d mutate+flush=%v total(w/fsync)=%v rate=%.0f keys/s | leafRead=%.3f/key (%.1fB) treeRead=%.3f/key | leafWrite=%.4f/key (%.1fB) treeWrite=%.4f/key (%.1fB) fsync=%d | %.1f B/op %.2f allocs/op | root=%x",
 			scenario, v.id, v.label, len(batch),
-			mutateSyncDur.Round(time.Millisecond), totalDur.Round(time.Millisecond), row.keysPerSec,
+			mutateSyncDur.Round(time.Millisecond), totalDur.Round(time.Millisecond), keysPerSec,
 			float64(ioSnap.leafReadCalls)/n, float64(ioSnap.leafReadBytes)/n,
 			float64(ioSnap.treeReadCalls)/n,
 			float64(ioSnap.leafWriteCalls)/n, float64(ioSnap.leafWriteBytes)/n,
 			float64(ioSnap.treeWriteCalls)/n, float64(ioSnap.treeWriteBytes)/n,
 			ioSnap.fsyncCalls,
-			row.allocBytesOp, row.allocsOp, snap.Hash[:8])
-		return row
+			allocBytesOp, allocsOp, snap.Hash[:8])
+		return snap.Hash
 	}
 
 	// 1. Cold Build N = 200,000
@@ -512,13 +487,12 @@ func TestNVMeBenchMatrix(t *testing.T) {
 	var wantCold200k Hash
 	for i, v := range variants {
 		dir := filepath.Join(runDir, "cold200k-"+v.id)
-		row := runOne("Cold 200k", "cold200k", dir, true, 1, cold200k, v)
+		gotHash := runOne("Cold 200k", "cold200k", dir, true, 1, cold200k, v)
 		if i == 0 {
-			wantCold200k = row.rootHash
-		} else if row.rootHash != wantCold200k {
-			t.Fatalf("Cold 200k %s root hash mismatch: got %v, want %v", v.id, row.rootHash, wantCold200k)
+			wantCold200k = gotHash
+		} else if gotHash != wantCold200k {
+			t.Fatalf("Cold 200k %s root hash mismatch: got %v, want %v", v.id, gotHash, wantCold200k)
 		}
-		allRows = append(allRows, row)
 		_ = os.RemoveAll(dir)
 	}
 
@@ -528,13 +502,12 @@ func TestNVMeBenchMatrix(t *testing.T) {
 	var wantCold1M Hash
 	for i, v := range variants {
 		dir := filepath.Join(runDir, "cold1M-"+v.id)
-		row := runOne("Cold 1M", "cold1m", dir, true, 1, cold1M, v)
+		gotHash := runOne("Cold 1M", "cold1m", dir, true, 1, cold1M, v)
 		if i == 0 {
-			wantCold1M = row.rootHash
-		} else if row.rootHash != wantCold1M {
-			t.Fatalf("Cold 1M %s root hash mismatch: got %v, want %v", v.id, row.rootHash, wantCold1M)
+			wantCold1M = gotHash
+		} else if gotHash != wantCold1M {
+			t.Fatalf("Cold 1M %s root hash mismatch: got %v, want %v", v.id, gotHash, wantCold1M)
 		}
-		allRows = append(allRows, row)
 		if v.id == "D" {
 			// Measure exact tree depth on 1M tree before closing/copying, and preserve as warm base!
 			trCheck, err := Open(filepath.Join(dir, "mpt.tree1"), filepath.Join(dir, "mpt.tree2"), filepath.Join(dir, "mpt.disk"))
@@ -584,13 +557,12 @@ func TestNVMeBenchMatrix(t *testing.T) {
 		if err := copyTreeDir(base1MDir, dir); err != nil {
 			t.Fatal(err)
 		}
-		row := runOne("Warm +200k (on 1M)", "warm200k", dir, false, 2, warmBatch, v)
+		gotHash := runOne("Warm +200k (on 1M)", "warm200k", dir, false, 2, warmBatch, v)
 		if i == 0 {
-			wantWarm = row.rootHash
-		} else if row.rootHash != wantWarm {
-			t.Fatalf("Warm +200k %s root hash mismatch: got %v, want %v", v.id, row.rootHash, wantWarm)
+			wantWarm = gotHash
+		} else if gotHash != wantWarm {
+			t.Fatalf("Warm +200k %s root hash mismatch: got %v, want %v", v.id, gotHash, wantWarm)
 		}
-		allRows = append(allRows, row)
 		_ = os.RemoveAll(dir)
 	}
 }

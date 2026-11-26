@@ -290,7 +290,8 @@ type Tree interface {
 	// [MaxKeyLen] and [MaxValLen] bytes; otherwise SetBatch returns an error
 	// ([ErrKeyOrder], [ErrKeySize], or [ErrValSize]) without modifying the tree.
 	//
-	// SetBatch is a mutating operation and must not be called
+	// Like [Tree.Set], SetBatch marks the tree modified until the next [Tree.Snap],
+	// participates in [Tree.Version] crash recovery, and must not be called
 	// concurrently with any other Tree method calls.
 	SetBatch(changes []KeyVal) error
 
@@ -1027,28 +1028,19 @@ func bit(b []byte, n int) int {
 	return 1
 }
 
-// hashLeafFast computes hashLeaf without heap allocation when the encoded
-// leaf fits in a 256-byte stack buffer.
-func hashLeafFast(key Key, val Val) Hash {
-	needed := 1 + binary.MaxVarintLen64 + len(key) + binary.MaxVarintLen64 + len(val)
-	if needed <= 256 {
-		var buf [256]byte
-		buf[0] = 0
-		n := 1
-		n += binary.PutUvarint(buf[n:], uint64(len(key)))
-		n += copy(buf[n:], key)
-		n += binary.PutUvarint(buf[n:], uint64(len(val)))
-		n += copy(buf[n:], val)
-		return sha256.Sum256(buf[:n])
-	}
-	return hashLeaf(key, val)
-}
-
 // hashLeaf returns the hash of a leaf with a given key and value,
 // where key and val are variable-length byte slices.
 // The hash is H(0 || len(key) || key || len(val) || val),
 // where the lengths are varint-encoded.
 func hashLeaf(key Key, val Val) Hash {
+	if needed := 1 + binary.MaxVarintLen64 + len(key) + binary.MaxVarintLen64 + len(val); needed <= 256 {
+		var buf [256]byte
+		n := 1 + binary.PutUvarint(buf[1:], uint64(len(key)))
+		n += copy(buf[n:], key)
+		n += binary.PutUvarint(buf[n:], uint64(len(val)))
+		n += copy(buf[n:], val)
+		return sha256.Sum256(buf[:n])
+	}
 	h := sha256.New()
 	h.Write([]byte{0})
 	var buf [binary.MaxVarintLen64]byte

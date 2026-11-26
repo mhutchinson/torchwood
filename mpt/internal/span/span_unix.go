@@ -102,3 +102,33 @@ func (s *Span) UnsafeUnmap() error {
 	s.released = nil
 	return nil
 }
+
+// MapFile memory-maps regular file fd up to maxLen bytes with MAP_SHARED.
+// It returns the mapped slice, whether the mapping is writable, the current
+// file size on disk, and whether mapping succeeded.
+func MapFile(fd uintptr, maxLen int) (data []byte, writable bool, fileSize int64, ok bool) {
+	var st unix.Stat_t
+	if err := unix.Fstat(int(fd), &st); err != nil || (st.Mode&unix.S_IFMT) != unix.S_IFREG {
+		return nil, false, 0, false
+	}
+	if mapped, err := unix.Mmap(int(fd), 0, maxLen, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED); err == nil {
+		return mapped, true, int64(st.Size), true
+	}
+	if mapped, err := unix.Mmap(int(fd), 0, maxLen, unix.PROT_READ, unix.MAP_SHARED); err == nil {
+		return mapped, false, int64(st.Size), true
+	}
+	return nil, false, 0, false
+}
+
+// SyncFile flushes dirty mapped pages in data[:length] to disk.
+func SyncFile(data []byte, length int) error {
+	if length <= 0 {
+		return nil
+	}
+	return unix.Msync(data[:min(length, len(data))], unix.MS_SYNC)
+}
+
+// UnmapFile unmaps a slice previously returned by [MapFile].
+func UnmapFile(data []byte) error {
+	return unix.Munmap(data)
+}

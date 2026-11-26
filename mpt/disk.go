@@ -135,9 +135,10 @@ func newOptions(opts []Option) options {
 }
 
 // BufferLeafIO configures whether the on-disk tree coalesces leaf appends in
-// memory, reuses leaf encode/decode scratch buffers, and memory-maps the leaf
-// file for reads when backed by an OS file descriptor. It is disabled by
-// default.
+// memory, reuses leaf encode/decode scratch buffers, and—when the leaf [File]
+// implements Fd() uintptr for a regular OS file—memory-maps it with MAP_SHARED
+// so leaf reads and in-place value overwrites bypass [File.ReadAt] and
+// [File.WriteAt] syscalls. It is disabled by default.
 func BufferLeafIO(enable bool) Option {
 	return func(o *options) {
 		o.bufLeafIO = enable
@@ -296,6 +297,9 @@ func (t *diskTree) Close() error {
 	}
 	t.mem = nil
 	t.pmem = nil
+	t.leafBuf = nil
+	t.appendBuf = nil
+	t.bufPool = nil
 	if err := t.file1.Close(); err != nil {
 		t.broken(err)
 	}
@@ -499,18 +503,16 @@ func (n *diskNode) keyMut(t *diskTree) (Key, error) {
 	return key, err
 }
 
-// hashLeafAt loads the leaf at off and computes its leaf hash without mutating
-// shared tree scratch buffers, using a stack buffer when the encoded leaf fits
-// in 256 bytes so concurrent readers (Path, ProveLookup, ProvePrefix, Predict)
-// remain race-free and allocation-free.
+// hashLeafAt loads the leaf at off and computes its leaf hash using a stack
+// buffer when the encoded leaf fits in 256 bytes, keeping concurrent readers
+// (Path, Predict) race-free and allocation-free.
 func hashLeafAt(t *diskTree, off int64) (Hash, error) {
 	limit := t.pmem.DiskSize() - off
 	if limit <= 2 {
 		return Hash{}, t.broken(errCorrupt)
 	}
 	var stack [256]byte
-	need := int(min(limit, int64(len(stack))))
-	buf := stack[:need]
+	buf := stack[:min(limit, int64(len(stack)))]
 	if err := t.pmem.ReadDisk(buf, off); err != nil {
 		return Hash{}, t.broken(err)
 	}
@@ -523,24 +525,13 @@ func hashLeafAt(t *diskTree, off int64) (Hash, error) {
 		if err != nil {
 			return Hash{}, err
 		}
-		return hashLeafFast(key, val), nil
+		return hashLeaf(key, val), nil
 	}
-	buf = buf[:total]
-	i := 2
-	kn, kvn := binary.Uvarint(buf[i:])
-	if kvn <= 0 || kn > uint64(len(buf)-i-kvn) {
+	key, val, ok := decodeLeaf(buf[:total], true)
+	if !ok {
 		return Hash{}, t.broken(errCorrupt)
 	}
-	i += kvn
-	key := Key(buf[i : i+int(kn)])
-	i += int(kn)
-	vn, vvn := binary.Uvarint(buf[i:])
-	if vvn <= 0 || vn > uint64(len(buf)-i-vvn) {
-		return Hash{}, t.broken(errCorrupt)
-	}
-	i += vvn
-	val := Val(buf[i : i+int(vn)])
-	return hashLeafFast(key, val), nil
+	return hashLeaf(key, val), nil
 }
 
 // keyVal returns the key and value for node n.
@@ -658,39 +649,48 @@ func (n *diskNode) setVal(t *diskTree, val Val) error {
 	)
 	if t.bufLeafIO {
 		buf, key, _, err = loadLeafInto(t, t.leafBuf, off, false)
-		if err != nil {
-			return err
-		}
 		t.leafBuf = buf
 	} else {
 		buf, key, _, err = loadLeaf(t, off, false)
-		if err != nil {
-			return err
-		}
 	}
-	old := len(buf)
-	tn := 2 // uint16 len
-	_, kn := binary.Uvarint(buf[tn:])
-	vstart := tn + kn + len(key)
-	buf = append(binary.AppendUvarint(buf[:vstart], uint64(len(val))), val...)
-	if t.bufLeafIO {
-		t.leafBuf = buf
+	if err != nil {
+		return err
 	}
-	if len(buf) <= old {
+	return n.setValLoaded(t, off, buf, key, val)
+}
+
+func (n *diskNode) setValLoaded(t *diskTree, off int64, rawBuf []byte, key Key, val Val) error {
+	_, kn := binary.Uvarint(rawBuf[2:])
+	vstart := 2 + kn + len(key)
+	var vlenBuf [binary.MaxVarintLen64]byte
+	vlenN := binary.PutUvarint(vlenBuf[:], uint64(len(val)))
+	if vstart+vlenN+len(val) <= len(rawBuf) {
 		// Overwrite existing value in place.
-		if err := t.pmem.WriteDisk(buf[vstart:], off+int64(vstart)); err != nil {
+		needed := vlenN + len(val)
+		var buf []byte
+		if t.bufLeafIO {
+			buf = slices.Grow(t.appendBuf[:0], needed)
+		} else {
+			buf = make([]byte, 0, needed)
+		}
+		buf = append(buf, vlenBuf[:vlenN]...)
+		buf = append(buf, val...)
+		if t.bufLeafIO {
+			t.appendBuf = buf
+		}
+		if err := t.pmem.WriteDisk(buf, off+int64(vstart)); err != nil {
 			return t.broken(err)
 		}
 		return nil
 	}
 
 	// Abandon storage for new leaf at end of disk.
-	off = t.pmem.DiskSize()
+	newOff := t.pmem.DiskSize()
 	if err := appendLeaf(t, key, val); err != nil {
 		return err
 	}
 	var leaf [addrSize]byte
-	putAddr(leaf[:], addr(off))
+	putAddr(leaf[:], addr(newOff))
 	return t.mutate(n[nodeLeaf:nodeLeaf+addrSize], leaf[:])
 }
 
@@ -728,12 +728,18 @@ func loadLeafInto(t *diskTree, buf []byte, off int64, wantVal bool) (bufOut []by
 		}
 	}
 	buf = buf[:total]
+	key, val, ok := decodeLeaf(buf, wantVal)
+	if !ok {
+		return nil, nil, nil, t.broken(errCorrupt)
+	}
+	return buf, key, val, nil
+}
 
-	// Decode buffer.
+func decodeLeaf(buf []byte, wantVal bool) (key Key, val Val, ok bool) {
 	i := 2 // uint16 len
 	kn, kvn := binary.Uvarint(buf[i:])
 	if kvn <= 0 || kn > uint64(len(buf)-i-kvn) {
-		return nil, nil, nil, t.broken(errCorrupt)
+		return nil, nil, false
 	}
 	i += kvn
 	key = buf[i : i+int(kn)]
@@ -741,10 +747,10 @@ func loadLeafInto(t *diskTree, buf []byte, off int64, wantVal bool) (bufOut []by
 	if wantVal {
 		vn, vvn := binary.Uvarint(buf[i:])
 		if vvn <= 0 || vn > uint64(len(buf)-i-vvn) {
-			return nil, nil, nil, t.broken(errCorrupt)
+			return nil, nil, false
 		}
 		i += vvn
 		val = buf[i : i+int(vn)]
 	}
-	return buf, key, val, nil
+	return key, val, true
 }

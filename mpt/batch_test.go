@@ -536,14 +536,22 @@ func TestSetBatchDifferentialRandom(t *testing.T) {
 }
 
 func TestSetBatchCrashRecovery(t *testing.T) {
+	for _, bufIO := range []bool{false, true} {
+		t.Run(fmt.Sprintf("bufLeafIO=%v", bufIO), func(t *testing.T) {
+			testSetBatchCrashRecovery(t, bufIO)
+		})
+	}
+}
+
+func testSetBatchCrashRecovery(t *testing.T, bufIO bool) {
 	// Simulate crashes after every individual pmem mutation during SetBatch
-	// using SetConstantFlushing(true), verifying that reopening and replaying
-	// from the last exact Version produces the exact target tree state.
+	// using SetConstantFlushing(true), verifying both that intermediate crash
+	// states satisfy tree hash/dirty invariants and that replaying from the
+	// last exact Version produces the exact target tree state.
 	var files [3]memFile
-	xtree, err := New(&files[0], &files[1], &files[2])
+	xtree, err := New(&files[0], &files[1], &files[2], BufferLeafIO(bufIO))
 	check(t, err)
 	dt := xtree.(*diskTree)
-	defer dt.Close()
 
 	// Seed version 1 and sync.
 	var v1Batch []KeyVal
@@ -563,21 +571,15 @@ func TestSetBatchCrashRecovery(t *testing.T) {
 	}
 	slices.SortFunc(v2Batch, KeyVal.CompareKey)
 
-	// Compute expected final root hash at version 2.
 	wantHash, err := dt.Predict(v2Batch)
 	check(t, err)
+	check(t, dt.Close())
 
 	// Capture every intermediate disk state produced during SetBatch.
 	type diskSnap struct {
 		f0, f1, f2 []byte
 	}
 	var states []diskSnap
-	dt.pmem.SetConstantFlushing(true)
-
-	// Record snapshots at intervals via a wrapper on files[0..2]? Even simpler:
-	// run SetBatch with a hookFile that snapshots all 3 files on every WriteAt!
-	check(t, dt.Close())
-
 	var hfiles [3]*hookFile
 	snapshotAll := func() {
 		states = append(states, diskSnap{
@@ -593,7 +595,7 @@ func TestSetBatchCrashRecovery(t *testing.T) {
 		hfiles[i].onWrite = snapshotAll
 	}
 
-	xtree2, err := New(hfiles[0], hfiles[1], hfiles[2])
+	xtree2, err := New(hfiles[0], hfiles[1], hfiles[2], BufferLeafIO(bufIO))
 	check(t, err)
 	dt2 := xtree2.(*diskTree)
 	defer dt2.Close()
@@ -609,7 +611,7 @@ func TestSetBatchCrashRecovery(t *testing.T) {
 	}
 
 	// Sample intermediate crash states (including first, last, and stride across all writes)
-	// and verify recovery via both Set replay and SetBatch replay!
+	// and verify pre-replay tree invariants plus recovery via Set and SetBatch replay.
 	stride := max(1, len(states)/40)
 	for idx := 0; idx < len(states); idx += stride {
 		st := states[idx]
@@ -618,10 +620,12 @@ func TestSetBatchCrashRecovery(t *testing.T) {
 			f1 := &memFile{data: bytes.Clone(st.f1)}
 			f2 := &memFile{data: bytes.Clone(st.f2)}
 
-			rec, err := New(f0, f1, f2)
+			rec, err := New(f0, f1, f2, BufferLeafIO(bufIO))
 			if err != nil {
 				t.Fatalf("state %d/%d reopen failed: %v", idx, len(states), err)
 			}
+			checkDiskInvariants(t, rec)
+
 			ver, exact := rec.Version()
 			if ver < 1 {
 				rec.Close()

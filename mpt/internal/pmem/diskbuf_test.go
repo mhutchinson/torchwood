@@ -9,10 +9,15 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
 func TestBufferedDiskAndMmap(t *testing.T) {
+	skipIfRaceDarwin(t)
+	oldMem := SetMaxMem(64 << 20)
+	defer SetMaxMem(oldMem)
+
 	dir := t.TempDir()
 	openFiles := func(flag int) (*os.File, *os.File, *os.File) {
 		t.Helper()
@@ -29,8 +34,8 @@ func TestBufferedDiskAndMmap(t *testing.T) {
 	m, err := Create("magic", f1, f2, disk)
 	check(t, err)
 	m.EnableBufferedDisk()
-	if m.diskMap == nil {
-		t.Fatal("expected diskMap to be initialized for *os.File")
+	if runtime.GOOS == "linux" && m.diskMap == nil {
+		t.Fatal("expected diskMap to be initialized for *os.File on Linux")
 	}
 
 	var shadow []byte
@@ -115,5 +120,76 @@ func TestBufferedDiskAndMmap(t *testing.T) {
 	check(t, m2.ReadDisk(got, 0))
 	if !bytes.Equal(got, shadow) {
 		t.Fatal("content mismatch after reopen")
+	}
+}
+
+func TestBufferedDiskTruncatedFileNoSIGBUS(t *testing.T) {
+	skipIfRaceDarwin(t)
+	oldPatch := maxPatch
+	oldMem := maxMem
+	defer func() {
+		maxPatch = oldPatch
+		maxMem = oldMem
+	}()
+	maxPatch = 256
+	maxMem = 1 << 20
+
+	dir := t.TempDir()
+	openFiles := func(flag int) (*os.File, *os.File, *os.File) {
+		t.Helper()
+		f1, err := os.OpenFile(filepath.Join(dir, "tree1"), flag, 0o666)
+		check(t, err)
+		f2, err := os.OpenFile(filepath.Join(dir, "tree2"), flag, 0o666)
+		check(t, err)
+		disk, err := os.OpenFile(filepath.Join(dir, "disk"), flag, 0o666)
+		check(t, err)
+		return f1, f2, disk
+	}
+
+	f1, f2, disk := openFiles(os.O_RDWR | os.O_CREATE | os.O_EXCL)
+	m, err := Create("magic", f1, f2, disk)
+	check(t, err)
+	m.EnableBufferedDisk()
+
+	chunk := bytes.Repeat([]byte("x"), 128)
+	for i := range 64 {
+		check(t, m.WriteDisk(chunk, int64(i*len(chunk))))
+	}
+	// Trigger compaction so diskSize is persisted via a zero-length diskLenPatch.
+	tmp := make([]byte, 100)
+	for i := range 200 {
+		off := i % 50
+		_, err := m.Expand(off + 100)
+		check(t, err)
+		check(t, m.Mutate(m.Data()[off:off+100], tmp))
+	}
+	check(t, m.Sync())
+	diskHeaderEnd := m.diskOff
+	check(t, m.Release())
+	check(t, m.UnsafeUnmap())
+	_ = f1.Close()
+	_ = f2.Close()
+	_ = disk.Close()
+
+	// Truncate the disk file down to just its pmem header (losing payload pages).
+	check(t, os.Truncate(filepath.Join(dir, "disk"), diskHeaderEnd))
+
+	f1, f2, disk = openFiles(os.O_RDWR)
+	defer f1.Close()
+	defer f2.Close()
+	defer disk.Close()
+
+	m2, err := Open("magic", f1, f2, disk)
+	check(t, err)
+	m2.EnableBufferedDisk()
+	defer func() {
+		_ = m2.Release()
+		_ = m2.UnsafeUnmap()
+	}()
+
+	// Reading truncated pages must return an error cleanly rather than SIGBUS.
+	buf := make([]byte, 4096)
+	if err := m2.ReadDisk(buf, 4096); err == nil {
+		t.Fatal("expected error reading truncated disk file, got nil")
 	}
 }

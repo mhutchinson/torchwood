@@ -7,6 +7,7 @@ package mpt
 import (
 	"bytes"
 	"encoding/binary"
+	"slices"
 )
 
 // SetBatch adds or updates the given pre-sorted key-value pairs in the in-memory tree.
@@ -57,7 +58,7 @@ func (t *diskTree) SetBatch(changes []KeyVal) error {
 			return err
 		}
 		if err := t.pmem.Sync(); err != nil {
-			return err
+			return t.broken(err)
 		}
 	}
 	if !t.hdr().dirty() {
@@ -88,13 +89,6 @@ func (t *diskTree) SetBatch(changes []KeyVal) error {
 	}
 	_ = t.check // t.check()
 	return nil
-}
-
-func (t *diskTree) leafHash(key Key, val Val) Hash {
-	if t.bufLeafIO {
-		return hashLeafFast(key, val)
-	}
-	return hashLeaf(key, val)
 }
 
 func (t *diskTree) getProbeBuf() []byte {
@@ -149,7 +143,7 @@ func (t *diskTree) buildEmptyBatch(changes []KeyVal) (addr, error) {
 
 	mid := batchItem{
 		key:  prefix(first.Key, maxKeyBits),
-		hash: t.leafHash(first.Key, first.Val),
+		hash: hashLeaf(first.Key, first.Val),
 		addr: nilAddr,
 	}
 	res, err := t.mergeAround(nil, mid, changes[1:])
@@ -234,12 +228,12 @@ func (t *diskTree) setBatchSubtree(a addr, pbit int, batch []KeyVal, probed *pro
 		var h Hash
 		if len(inside) == 1 {
 			newVal := inside[0].Val
-			if err := t.setValLoaded(n, probed, newVal); err != nil {
+			if err := n.setValLoaded(t, probed.leafOff, probed.rawBuf, probed.key, newVal); err != nil {
 				return 0, Hash{}, err
 			}
-			h = t.leafHash(probed.key, newVal)
+			h = hashLeaf(probed.key, newVal)
 		} else {
-			h = t.leafHash(probed.key, probed.val)
+			h = hashLeaf(probed.key, probed.val)
 		}
 		mid = batchItem{
 			key:  pkey,
@@ -264,6 +258,13 @@ func (t *diskTree) setBatchSubtree(a addr, pbit int, batch []KeyVal, probed *pro
 		}
 	} else {
 		// Inner node with modifications inside its subtree.
+		// Mark n dirty before mutating descendants so any intermediate
+		// pmem state flushed prior to unwind remains hash-consistent.
+		if !n.dirty() {
+			if err := n.setDirty(t, true); err != nil {
+				return 0, Hash{}, err
+			}
+		}
 		inLeft, inRight := splitAtBit(inside, nbit)
 		probedRight := probed.key.bit(nbit) != 0
 
@@ -331,22 +332,14 @@ func (t *diskTree) setBatchSubtree(a addr, pbit int, batch []KeyVal, probed *pro
 			return 0, Hash{}, err
 		}
 		h := hashInner(nbit, lHash, rHash)
-		if lAddr == n.left() && rAddr == n.right() && !n.dirty() {
-			if h != n.ihash() {
-				if err := n.setIHash(t, h); err != nil {
-					return 0, Hash{}, err
-				}
-			}
-		} else {
-			var buf [nodeSize]byte
-			binary.BigEndian.PutUint16(buf[nodeBitDirty:], uint16(nbit)<<1) // dirty=0
-			putAddr(buf[nodeLeft:], lAddr)
-			putAddr(buf[nodeRight:], rAddr)
-			copy(buf[nodeLeaf:nodeLeaf+addrSize], n[nodeLeaf:nodeLeaf+addrSize])
-			copy(buf[nodeIHash:], h[:])
-			if err := t.mutate(n[:], buf[:]); err != nil {
-				return 0, Hash{}, err
-			}
+		var buf [nodeSize]byte
+		binary.BigEndian.PutUint16(buf[nodeBitDirty:], uint16(nbit)<<1) // dirty=0
+		putAddr(buf[nodeLeft:], lAddr)
+		putAddr(buf[nodeRight:], rAddr)
+		copy(buf[nodeLeaf:nodeLeaf+addrSize], n[nodeLeaf:nodeLeaf+addrSize])
+		copy(buf[nodeIHash:], h[:])
+		if err := t.mutate(n[:], buf[:]); err != nil {
+			return 0, Hash{}, err
 		}
 		mid = batchItem{
 			key:  pkey,
@@ -363,40 +356,6 @@ func (t *diskTree) setBatchSubtree(a addr, pbit int, batch []KeyVal, probed *pro
 		return 0, Hash{}, err
 	}
 	return res.addr, res.hash, nil
-}
-
-// setValLoaded updates node n's leaf value using the already-loaded probedLeaf
-// without issuing a duplicate loadLeaf read.
-func (t *diskTree) setValLoaded(n *diskNode, probed *probedLeaf, val Val) error {
-	old := len(probed.rawBuf)
-	_, kn := binary.Uvarint(probed.rawBuf[2:])
-	vstart := 2 + kn + len(probed.key)
-
-	var vlenBuf [binary.MaxVarintLen64]byte
-	vlenN := binary.PutUvarint(vlenBuf[:], uint64(len(val)))
-	if vstart+vlenN+len(val) <= old {
-		needed := vlenN + len(val)
-		buf := t.appendBuf[:0]
-		if cap(buf) < needed {
-			buf = make([]byte, 0, max(needed, 128))
-		}
-		buf = append(buf, vlenBuf[:vlenN]...)
-		buf = append(buf, val...)
-		t.appendBuf = buf
-		if err := t.pmem.WriteDisk(buf, probed.leafOff+int64(vstart)); err != nil {
-			return t.broken(err)
-		}
-		return nil
-	}
-
-	// Abandon storage for new leaf at end of disk.
-	off := t.pmem.DiskSize()
-	if err := appendLeaf(t, probed.key, val); err != nil {
-		return err
-	}
-	var leaf [addrSize]byte
-	putAddr(leaf[:], addr(off))
-	return t.mutate(n[nodeLeaf:nodeLeaf+addrSize], leaf[:])
 }
 
 // A batchItem represents a subtree on the reduction stack during mergeAround.
@@ -447,7 +406,7 @@ func (t *diskTree) mergeAround(before []KeyVal, mid batchItem, after []KeyVal) (
 	for _, kv := range before {
 		if err := push(batchItem{
 			key:  prefix(kv.Key, maxKeyBits),
-			hash: t.leafHash(kv.Key, kv.Val),
+			hash: hashLeaf(kv.Key, kv.Val),
 			kv:   kv,
 		}); err != nil {
 			return batchItem{}, err
@@ -459,7 +418,7 @@ func (t *diskTree) mergeAround(before []KeyVal, mid batchItem, after []KeyVal) (
 	for _, kv := range after {
 		if err := push(batchItem{
 			key:  prefix(kv.Key, maxKeyBits),
-			hash: t.leafHash(kv.Key, kv.Val),
+			hash: hashLeaf(kv.Key, kv.Val),
 			kv:   kv,
 		}); err != nil {
 			return batchItem{}, err
@@ -572,36 +531,6 @@ func partitionByPrefix(batch []KeyVal, p keyPrefix) (before, inside, after []Key
 	if n == 0 {
 		return nil, nil, nil
 	}
-	if p.bits == maxKeyBits {
-		cFirst := batch[0].Key.Compare(p.full)
-		if cFirst > 0 {
-			return nil, nil, batch
-		}
-		if cFirst == 0 {
-			return nil, batch[:1], batch[1:]
-		}
-		cLast := batch[n-1].Key.Compare(p.full)
-		if cLast < 0 {
-			return batch, nil, nil
-		}
-		if cLast == 0 {
-			return batch[:n-1], batch[n-1:], nil
-		}
-		lo, hi := 1, n-1
-		for lo < hi {
-			mid := int(uint(lo+hi) >> 1)
-			if batch[mid].Key.Compare(p.full) < 0 {
-				lo = mid + 1
-			} else {
-				hi = mid
-			}
-		}
-		if lo < n && bytes.Equal(batch[lo].Key, p.full) {
-			return batch[:lo], batch[lo : lo+1], batch[lo+1:]
-		}
-		return batch[:lo], nil, batch[lo:]
-	}
-
 	cFirst := prefix(batch[0].Key, p.bits).compare(p)
 	if cFirst > 0 {
 		return nil, nil, batch
@@ -616,30 +545,25 @@ func partitionByPrefix(batch []KeyVal, p keyPrefix) (before, inside, after []Key
 
 	inStart := 0
 	if cFirst < 0 {
-		lo, hi := 1, n
-		for lo < hi {
-			mid := int(uint(lo+hi) >> 1)
-			if prefix(batch[mid].Key, p.bits).compare(p) < 0 {
-				lo = mid + 1
-			} else {
-				hi = mid
-			}
-		}
-		inStart = lo
+		inStart, _ = slices.BinarySearchFunc(batch, p, func(kv KeyVal, target keyPrefix) int {
+			return prefix(kv.Key, target.bits).compare(target)
+		})
 	}
-
+	if p.bits == maxKeyBits {
+		if inStart < n && bytes.Equal(batch[inStart].Key, p.full) {
+			return batch[:inStart], batch[inStart : inStart+1], batch[inStart+1:]
+		}
+		return batch[:inStart], nil, batch[inStart:]
+	}
 	inEnd := n
 	if cLast > 0 {
-		lo, hi := inStart, n-1
-		for lo < hi {
-			mid := int(uint(lo+hi) >> 1)
-			if prefix(batch[mid].Key, p.bits).compare(p) <= 0 {
-				lo = mid + 1
-			} else {
-				hi = mid
+		off, _ := slices.BinarySearchFunc(batch[inStart:], p, func(kv KeyVal, target keyPrefix) int {
+			if prefix(kv.Key, target.bits).compare(target) <= 0 {
+				return -1
 			}
-		}
-		inEnd = lo
+			return 1
+		})
+		inEnd = inStart + off
 	}
 	return batch[:inStart], batch[inStart:inEnd], batch[inEnd:]
 }
@@ -648,23 +572,14 @@ func partitionByPrefix(batch []KeyVal, p keyPrefix) (before, inside, after []Key
 // into keys with bit(b) == 0 and keys with bit(b) == 1.
 func splitAtBit(inside []KeyVal, b int) (left, right []KeyVal) {
 	n := len(inside)
-	if n == 0 {
-		return nil, nil
-	}
-	if inside[0].Key.bit(b) != 0 {
+	if n == 0 || inside[0].Key.bit(b) != 0 {
 		return nil, inside
 	}
 	if inside[n-1].Key.bit(b) == 0 {
 		return inside, nil
 	}
-	lo, hi := 1, n-1
-	for lo < hi {
-		mid := int(uint(lo+hi) >> 1)
-		if inside[mid].Key.bit(b) == 0 {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	return inside[:lo], inside[lo:]
+	i, _ := slices.BinarySearchFunc(inside, b, func(kv KeyVal, bitIdx int) int {
+		return kv.Key.bit(bitIdx) - 1
+	})
+	return inside[:i], inside[i:]
 }
