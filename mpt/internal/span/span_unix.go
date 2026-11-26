@@ -120,14 +120,6 @@ func MapFile(fd uintptr, maxLen int) (data []byte, writable bool, fileSize int64
 	return nil, false, 0, false
 }
 
-// SyncFile flushes dirty mapped pages in data[:length] to disk.
-func SyncFile(data []byte, length int) error {
-	if length <= 0 {
-		return nil
-	}
-	return unix.Msync(data[:min(length, len(data))], unix.MS_SYNC)
-}
-
 // UnmapFile unmaps a slice previously returned by [MapFile].
 func UnmapFile(data []byte) error {
 	return unix.Munmap(data)

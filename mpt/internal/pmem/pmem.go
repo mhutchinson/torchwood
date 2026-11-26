@@ -743,7 +743,7 @@ func (m *Mem) EnableBufferedDisk() {
 	m.diskFlushed = m.diskSize
 	m.diskBuf = make([]byte, 0, maxDiskBuf)
 	if f, ok := m.disk.(interface{ Fd() uintptr }); ok {
-		if mapped, writable, fileSize, ok := span.MapFile(f.Fd(), min(maxMem, 64<<30)); ok {
+		if mapped, writable, fileSize, ok := span.MapFile(f.Fd(), min(maxMem, 1<<40)); ok {
 			m.diskMap = mapped
 			m.diskMapWrite = writable
 			m.diskFlushed = min(m.diskSize, max(0, fileSize-m.diskOff))
@@ -767,11 +767,6 @@ func (m *Mem) flushDiskBuf() error {
 func (m *Mem) syncDisk() error {
 	if m.disk == nil {
 		return nil
-	}
-	if m.diskMapDirty && m.diskMap != nil {
-		if err := span.SyncFile(m.diskMap, int(m.diskOff+m.diskFlushed)); err != nil {
-			return m.broken(err)
-		}
 	}
 	if err := m.disk.Sync(); err != nil {
 		return m.broken(err)
