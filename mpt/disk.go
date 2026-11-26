@@ -99,8 +99,9 @@ type diskTree struct {
 	closed bool
 	err    error // sticky error
 
-	leafBuf   []byte // reusable scratch buffer for single-writer leaf reads
-	appendBuf []byte // reusable scratch buffer for single-writer leaf writes
+	leafBuf   []byte   // reusable scratch buffer for single-writer leaf reads
+	appendBuf []byte   // reusable scratch buffer for single-writer leaf writes
+	bufPool   [][]byte // reusable buffers for recursive SetBatch leaf probes
 }
 
 // broken marks the tree broken with err as the reason.
@@ -263,6 +264,7 @@ func (t *diskTree) Close() error {
 	t.pmem = nil
 	t.leafBuf = nil
 	t.appendBuf = nil
+	t.bufPool = nil
 	if err := t.file1.Close(); err != nil {
 		t.broken(err)
 	}

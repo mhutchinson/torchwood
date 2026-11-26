@@ -284,6 +284,17 @@ type Tree interface {
 	// (including other calls to Set).
 	Set(key Key, val Val) error
 
+	// SetBatch adds or updates the given key-value pairs in the tree.
+	// Changes must be sorted in strictly increasing key order (by [Key.Compare])
+	// with no duplicate keys, and each key and value must be at most
+	// [MaxKeyLen] and [MaxValLen] bytes; otherwise SetBatch returns an error
+	// ([ErrKeyOrder], [ErrKeySize], or [ErrValSize]) without modifying the tree.
+	//
+	// Like [Tree.Set], SetBatch marks the tree modified until the next [Tree.Snap],
+	// participates in [Tree.Version] crash recovery, and must not be called
+	// concurrently with any other Tree method calls.
+	SetBatch(changes []KeyVal) error
+
 	// Predict returns the hash of the tree that would result from
 	// applying the given changes (sorted by key) to the tree,
 	// without modifying the tree.
@@ -394,6 +405,25 @@ func checkChanges(changes []KeyVal) error {
 	for i := 0; i < len(changes)-1; i++ {
 		if changes[i].Key.Compare(changes[i+1].Key) >= 0 {
 			return ErrInvalidPredict
+		}
+	}
+	return nil
+}
+
+// checkBatch validates SetBatch inputs, returning the specific ErrKeySize,
+// ErrValSize, and ErrKeyOrder sentinels rather than Predict's ErrInvalidPredict.
+func checkBatch(changes []KeyVal) error {
+	for _, c := range changes {
+		if len(c.Key) > MaxKeyLen {
+			return ErrKeySize
+		}
+		if len(c.Val) > MaxValLen {
+			return ErrValSize
+		}
+	}
+	for i := 0; i < len(changes)-1; i++ {
+		if changes[i].Key.Compare(changes[i+1].Key) >= 0 {
+			return ErrKeyOrder
 		}
 	}
 	return nil
