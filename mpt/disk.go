@@ -98,6 +98,9 @@ type diskTree struct {
 	leaf   File
 	closed bool
 	err    error // sticky error
+
+	leafBuf   []byte // reusable scratch buffer for single-writer leaf reads
+	appendBuf []byte // reusable scratch buffer for single-writer leaf writes
 }
 
 // broken marks the tree broken with err as the reason.
@@ -258,6 +261,8 @@ func (t *diskTree) Close() error {
 	}
 	t.mem = nil
 	t.pmem = nil
+	t.leafBuf = nil
+	t.appendBuf = nil
 	if err := t.file1.Close(); err != nil {
 		t.broken(err)
 	}
@@ -449,6 +454,14 @@ func (n *diskNode) key(t *diskTree) (Key, error) {
 	return key, err
 }
 
+// keyMut returns the key for node n reusing t.leafBuf.
+// It may only be called from single-writer mutation paths (such as Set).
+func (n *diskNode) keyMut(t *diskTree) (Key, error) {
+	buf, key, _, err := loadLeafInto(t, t.leafBuf, int64(n.leaf()), false)
+	t.leafBuf = buf
+	return key, err
+}
+
 // keyVal returns the key and value for node n.
 func (n *diskNode) keyVal(t *diskTree) (Key, Val, error) {
 	_, key, val, err := loadLeaf(t, int64(n.leaf()), true)
@@ -523,7 +536,8 @@ func (n *diskNode) setDirty(t *diskTree, d bool) error {
 // recovery (Version + Set) which will correct any corrupted values.
 
 func appendLeaf(t *diskTree, key Key, val Val) error {
-	buf := make([]byte, 2, 256)
+	needed := 2 + binary.MaxVarintLen64 + len(key) + binary.MaxVarintLen64 + len(val)
+	buf := slices.Grow(t.appendBuf[:0], max(needed, 256))[:2]
 	buf = binary.AppendUvarint(buf, uint64(len(key)))
 	buf = append(buf, key...)
 	buf = binary.AppendUvarint(buf, uint64(len(val)))
@@ -533,6 +547,7 @@ func appendLeaf(t *diskTree, key Key, val Val) error {
 		panic("overflow in setKeyVal")
 	}
 	binary.BigEndian.PutUint16(buf, uint16(len(buf)))
+	t.appendBuf = buf
 
 	off := t.pmem.DiskSize()
 	if err := t.pmem.WriteDisk(buf, off); err != nil {
@@ -544,47 +559,64 @@ func appendLeaf(t *diskTree, key Key, val Val) error {
 func (n *diskNode) setVal(t *diskTree, val Val) error {
 	// Read existing key-val data in hopes of updating in place on disk.
 	off := int64(n.leaf())
-	buf, key, _, err := loadLeaf(t, off, false)
+	buf, key, _, err := loadLeafInto(t, t.leafBuf, off, false)
 	if err != nil {
 		return err
 	}
-	old := len(buf)
-	tn := 2 // uint16 len
-	_, kn := binary.Uvarint(buf[tn:])
-	vstart := tn + kn + len(key)
-	buf = append(binary.AppendUvarint(buf[:vstart], uint64(len(val))), val...)
-	if len(buf) <= old {
+	t.leafBuf = buf
+	return n.setValLoaded(t, off, buf, key, val)
+}
+
+func (n *diskNode) setValLoaded(t *diskTree, off int64, rawBuf []byte, key Key, val Val) error {
+	_, kn := binary.Uvarint(rawBuf[2:])
+	vstart := 2 + kn + len(key)
+	var vlenBuf [binary.MaxVarintLen64]byte
+	vlenN := binary.PutUvarint(vlenBuf[:], uint64(len(val)))
+	if vstart+vlenN+len(val) <= len(rawBuf) {
 		// Overwrite existing value in place.
-		if err := t.pmem.WriteDisk(buf[vstart:], off+int64(vstart)); err != nil {
+		buf := slices.Grow(t.appendBuf[:0], vlenN+len(val))
+		buf = append(buf, vlenBuf[:vlenN]...)
+		buf = append(buf, val...)
+		t.appendBuf = buf
+		if err := t.pmem.WriteDisk(buf, off+int64(vstart)); err != nil {
 			return t.broken(err)
 		}
 		return nil
 	}
 
 	// Abandon storage for new leaf at end of disk.
-	off = t.pmem.DiskSize()
+	newOff := t.pmem.DiskSize()
 	if err := appendLeaf(t, key, val); err != nil {
 		return err
 	}
 	var leaf [addrSize]byte
-	putAddr(leaf[:], addr(off))
+	putAddr(leaf[:], addr(newOff))
 	return t.mutate(n[nodeLeaf:nodeLeaf+addrSize], leaf[:])
 }
 
 // loadLeaf loads a key-value pair from the leaf disk.
 // If wantVal is false, it skips loading (and ignores any corruption in) the value.
 func loadLeaf(t *diskTree, off int64, wantVal bool) (buf []byte, key Key, val Val, err error) {
+	return loadLeafInto(t, nil, off, wantVal)
+}
+
+func loadLeafInto(t *diskTree, buf []byte, off int64, wantVal bool) (bufOut []byte, key Key, val Val, err error) {
 	// Read initial chunk, decode total, read more if needed, and trim buf.
 	limit := t.pmem.DiskSize() - off
 	if limit <= 2 {
 		return nil, nil, nil, t.broken(errCorrupt)
 	}
-	buf = make([]byte, int(min(limit, 256)))
+	need := int(min(limit, 256))
+	if cap(buf) < need {
+		buf = make([]byte, need)
+	} else {
+		buf = buf[:need]
+	}
 	if err := t.pmem.ReadDisk(buf, off); err != nil {
 		return nil, nil, nil, t.broken(err)
 	}
 	total := int(binary.BigEndian.Uint16(buf))
-	if total > 2+2*binary.MaxVarintLen64+MaxKeyLen+MaxValLen || int64(total) > limit {
+	if total < 2 || total > 2+2*binary.MaxVarintLen64+MaxKeyLen+MaxValLen || int64(total) > limit {
 		return nil, nil, nil, t.broken(errCorrupt)
 	}
 	if len(buf) < total {

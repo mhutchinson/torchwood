@@ -192,7 +192,7 @@ func (n *diskNode) set(t *diskTree, pbit int, key Key, val Val) (int, error) {
 	nbit := n.bit()
 	if nbit <= pbit {
 		// view n as leaf
-		nkey, err := n.key(t)
+		nkey, err := n.keyMut(t)
 		if err != nil {
 			return 0, err
 		}

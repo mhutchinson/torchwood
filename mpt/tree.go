@@ -1005,6 +1005,14 @@ func bit(b []byte, n int) int {
 // The hash is H(0 || len(key) || key || len(val) || val),
 // where the lengths are varint-encoded.
 func hashLeaf(key Key, val Val) Hash {
+	if needed := 1 + binary.MaxVarintLen64 + len(key) + binary.MaxVarintLen64 + len(val); needed <= 256 {
+		var buf [256]byte
+		n := 1 + binary.PutUvarint(buf[1:], uint64(len(key)))
+		n += copy(buf[n:], key)
+		n += binary.PutUvarint(buf[n:], uint64(len(val)))
+		n += copy(buf[n:], val)
+		return sha256.Sum256(buf[:n])
+	}
 	h := sha256.New()
 	h.Write([]byte{0})
 	var buf [binary.MaxVarintLen64]byte
