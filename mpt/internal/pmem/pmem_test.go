@@ -549,8 +549,10 @@ func (tt *tester) markOK() {
 	}
 
 	if tt.mem.disk != nil && size > 0 {
+		// Read logical disk content via ReadDisk so bytes still pending in
+		// m.diskBuf (which recovery replays from the patch log) are recorded.
 		data := make([]byte, size)
-		tt.mem.disk.ReadAt(data, tt.mem.diskOff)
+		tt.mem.ReadDisk(data, 0)
 
 		for _, sizes := range tt.validDisk {
 			for s, vd := range sizes {

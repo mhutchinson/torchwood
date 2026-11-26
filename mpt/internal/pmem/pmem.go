@@ -204,6 +204,9 @@ type Mem struct {
 
 	constantFlushing bool
 
+	diskBuf    []byte // pending tail appends to disk
+	diskBufOff int64  // offset in disk-only data of diskBuf[0]
+
 	syncHook   func()
 	mutateHook func()
 }
@@ -565,6 +568,11 @@ func (m *Mem) readFile(r *reader) error {
 			return err
 		}
 	}
+	if m.disk != nil {
+		if err := m.flushDiskBuf(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -590,8 +598,8 @@ func (m *Mem) replay(patch []byte) error {
 		if isDisk {
 			// disk patch
 			if count > 0 {
-				if _, err := m.disk.WriteAt(patch[:count], m.diskOff+int64(off)); err != nil {
-					return m.broken(err)
+				if err := m.writeDisk(patch[:count], int64(off)); err != nil {
+					return err
 				}
 			}
 			m.diskSize = max(m.diskSize, int64(off+count))
@@ -721,6 +729,23 @@ func (m *Mem) Mutate(dst, src []byte) error {
 	})
 }
 
+const maxDiskBuf = 64 << 10
+
+// flushDiskBuf writes any pending disk-only appends to m.disk.
+// It must run before writing a patch frame describing those appends so a
+// patch is never durable while the disk bytes it refers to are still in memory.
+func (m *Mem) flushDiskBuf() error {
+	if len(m.diskBuf) == 0 {
+		return nil
+	}
+	if _, err := m.disk.WriteAt(m.diskBuf, m.diskOff+m.diskBufOff); err != nil {
+		return m.broken(err)
+	}
+	m.diskBufOff += int64(len(m.diskBuf))
+	m.diskBuf = m.diskBuf[:0]
+	return nil
+}
+
 // WriteDisk writes src to the disk-only file at offset off.
 // It guarantees that on recovery after a crash,
 // all disk writes that occurred in or before
@@ -735,14 +760,64 @@ func (m *Mem) WriteDisk(src []byte, off int64) error {
 		return nil
 	}
 	return m.mutate(uint64(off)<<1|1, src, func() error {
-		_, err := m.disk.WriteAt(src, m.diskOff+off)
-		if err != nil {
-			return m.broken(err)
+		if err := m.writeDisk(src, off); err != nil {
+			return err
 		}
 		m.diskSize = max(m.diskSize, off+int64(len(src)))
 		m.diskPatched = max(m.diskPatched, off+int64(len(src)))
 		return nil
 	})
+}
+
+func (m *Mem) writeDisk(src []byte, off int64) error {
+	// Contiguous tail append (including the first post-compaction replay write).
+	if (len(m.diskBuf) == 0 && off >= m.diskSize) ||
+		(len(m.diskBuf) > 0 && off == m.diskBufOff+int64(len(m.diskBuf))) {
+		if len(m.diskBuf)+len(src) > maxDiskBuf {
+			if err := m.flushDiskBuf(); err != nil {
+				return err
+			}
+		}
+		if len(src) >= maxDiskBuf {
+			if _, err := m.disk.WriteAt(src, m.diskOff+off); err != nil {
+				return m.broken(err)
+			}
+			return nil
+		}
+		if len(m.diskBuf) == 0 {
+			m.diskBufOff = off
+		}
+		m.diskBuf = append(m.diskBuf, src...)
+		if len(m.diskBuf) >= maxDiskBuf {
+			return m.flushDiskBuf()
+		}
+		return nil
+	}
+
+	end := off + int64(len(src))
+
+	// In-place overwrite wholly inside the pending tail buffer.
+	if len(m.diskBuf) > 0 && off >= m.diskBufOff && end <= m.diskBufOff+int64(len(m.diskBuf)) {
+		copy(m.diskBuf[off-m.diskBufOff:], src)
+		return nil
+	}
+
+	// Non-overlapping in-place overwrite before the pending tail buffer:
+	// write directly without disturbing pending tail appends.
+	if off >= 0 && end <= m.diskSize && (len(m.diskBuf) == 0 || end <= m.diskBufOff) {
+		if _, err := m.disk.WriteAt(src, m.diskOff+off); err != nil {
+			return m.broken(err)
+		}
+		return nil
+	}
+
+	if err := m.flushDiskBuf(); err != nil {
+		return err
+	}
+	if _, err := m.disk.WriteAt(src, m.diskOff+off); err != nil {
+		return m.broken(err)
+	}
+	return nil
 }
 
 // ReadDisk reads into dst from the disk-only file at offset off.
@@ -756,6 +831,26 @@ func (m *Mem) ReadDisk(dst []byte, off int64) error {
 	if len(dst) == 0 {
 		return nil
 	}
+	if len(m.diskBuf) > 0 && off+int64(len(dst)) > m.diskBufOff {
+		hi := m.diskBufOff + int64(len(m.diskBuf))
+		if off+int64(len(dst)) > hi {
+			return m.broken(fmt.Errorf("pmem: internal error: disk read past buffered data"))
+		}
+		if off >= m.diskBufOff {
+			copy(dst, m.diskBuf[off-m.diskBufOff:])
+			return nil
+		}
+		n := int(m.diskBufOff - off)
+		if err := m.readDisk(dst[:n], off); err != nil {
+			return err
+		}
+		copy(dst[n:], m.diskBuf)
+		return nil
+	}
+	return m.readDisk(dst, off)
+}
+
+func (m *Mem) readDisk(dst []byte, off int64) error {
 	_, err := m.disk.ReadAt(dst, m.diskOff+off)
 	if err != nil {
 		if err == io.EOF {
@@ -828,6 +923,11 @@ func (m *Mem) mutate(off uint64, src []byte, commit func() error) error {
 // If there is an active mutation group, only the buffer before
 // that group is written.
 func (m *Mem) flushPatch(needSpace bool) error {
+	if m.disk != nil {
+		if err := m.flushDiskBuf(); err != nil {
+			return err
+		}
+	}
 	var p []byte
 	if m.group >= 0 {
 		// Can only write up to m.group, but final mem len is already there.
